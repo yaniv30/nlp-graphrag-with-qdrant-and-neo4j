@@ -10,6 +10,9 @@ from graphrag.connectors.neo4j_connection import get_connection as get_neo4j_con
 from graphrag.connectors.qdrant_connection import get_connection as get_qdrant_connection
 from graphrag.utils.common import embed_text, DEFAULT_EMBEDDING_MODEL
 from graphrag.utils.logger import logger
+import torch
+
+device ="cuda" if torch.cuda.is_available() else "cpu"
 
 class Retriever:
     """Base class for retrieval in GraphRAG"""
@@ -98,7 +101,7 @@ class VectorRetriever(Retriever):
             # Find dimension of the model's embeddings
             try:
                 from sentence_transformers import SentenceTransformer
-                dim = SentenceTransformer(self.embedding_model).get_sentence_embedding_dimension()
+                dim = SentenceTransformer(self.embedding_model, device=device).get_sentence_embedding_dimension()
             except:
                 dim = 768  # Default fallback
             # Return a zero vector as fallback

@@ -6,6 +6,9 @@ import numpy as np
 import os
 from typing import List, Union
 from dotenv import load_dotenv
+import torch
+
+device ="cuda" if torch.cuda.is_available() else "cpu"
 
 # Load environment variables
 load_dotenv()
@@ -39,7 +42,7 @@ def get_embedding_model(model_name=None):
     try:
         from sentence_transformers import SentenceTransformer
         logger.info(f"Loading embedding model: {model_name}")
-        model = SentenceTransformer(model_name)
+        model = SentenceTransformer(model_name, device=device)
         _embedding_models[model_name] = model
         logger.info(f"Successfully loaded embedding model: {model_name}")
         return model

@@ -6,6 +6,9 @@ from dotenv import load_dotenv
 from graphrag.connectors.neo4j_connection import get_connection
 from graphrag.utils.common import embed_text
 from graphrag.utils.logger import logger
+import torch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load environment variables
 load_dotenv()
@@ -104,7 +107,7 @@ class TripletExtractor:
 
                 # Load the base model first
                 logger.info(f"Loading base model {base_model_name}")
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(base_model_name)
+                self.model = AutoModelForSeq2SeqLM.from_pretrained(base_model_name).to(device)
 
                 # If PEFT is available, load the adapter on top of the base model
                 if peft_available:
@@ -114,7 +117,7 @@ class TripletExtractor:
 
                     try:
                         # Try loading the PEFT adapter
-                        self.model = PeftModel.from_pretrained(self.model, model_name)
+                        self.model = PeftModel.from_pretrained(self.model, model_name).to(device)
                         logger.info("PEFT adapter loaded successfully")
                     except Exception as e:
                         logger.error(f"Error loading PEFT adapter: {str(e)}")
@@ -124,7 +127,7 @@ class TripletExtractor:
             else:
                 # Standard model loading for non-adapter models
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+                self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
 
             logger.info("Triplet extraction model loaded successfully")
         except Exception as e:
@@ -143,7 +146,7 @@ class TripletExtractor:
         """
         try:
             # Encode input sentence and generate model output
-            inputs = self.tokenizer(sentence, return_tensors="pt")
+            inputs = self.tokenizer(sentence, return_tensors="pt").to(device)
             outputs = self.model.generate(**inputs, max_length=64)
             # Do not skip special tokens so markers are preserved if present
             triplet_text = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
