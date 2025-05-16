@@ -220,15 +220,15 @@ class TripletExtractor:
         rel_clean = re.sub(r"[^0-9a-zA-Z_ ]", "", rel)
         return rel_clean.replace(" ", "_").upper()
 
-    def process_triplet(self, triplet: Tuple[str, str, str]) -> Any:
+    def process_triplet(self, triplet: Tuple[str, str, str], chunk_id: str) -> Any:
         """
         Process a single triplet: compute embeddings, search for similar nodes via vector queries,
-        and merge the triplet into the Neo4j graph.
+        and merge the triplet into the Neo4j graph, linking subject/object to their source chunk.
         """
         subject, predicate, object_ = triplet
         logger.info(f"[Triplet] Reçu : {triplet}")
 
-        # Nettoyage du nom de relation pour Neo4j
+        # Nettoyage du label de relation
         relation_label = predicate.strip().upper().replace(" ", "_").replace("-", "_")
 
         # Embeddings
@@ -243,95 +243,88 @@ class TripletExtractor:
             "subject": subject,
             "predicate": predicate,
             "object": object_,
+            "chunk_id": chunk_id,
         }
 
         similarSubjects = []
         similarPredicates = []
         similarObjects = []
 
-        # Vector search
         if self.supports_vector:
             try:
                 logger.info("[Neo4j] Recherche vectorielle activée")
 
-                similarSubjects_query = """
-                CALL {
-                    CALL db.index.vector.queryNodes('vector_index_entity', 10, $subject_emb)
-                    YIELD node AS vectorNode, score AS vectorScore
-                    WITH vectorNode, vectorScore
-                    WHERE vectorScore >= 0.96
-                    RETURN collect(vectorNode) AS similarSubjects
-                }
-                WITH similarSubjects
-                OPTIONAL MATCH (n:Entity {name: toLower($subject)})
-                WITH similarSubjects + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allSubjects
-                UNWIND allSubjects AS subject
-                RETURN collect(subject) AS similarSubjects
-                """
-                similarSubjects = self.neo4j.run_query(similarSubjects_query, params)[0]["similarSubjects"]
+                similarSubjects = self.neo4j.run_query("""
+                    CALL {
+                        CALL db.index.vector.queryNodes('vector_index_entity', 10, $subject_emb)
+                        YIELD node AS vectorNode, score AS vectorScore
+                        WITH vectorNode, vectorScore
+                        WHERE vectorScore >= 0.96
+                        RETURN collect(vectorNode) AS similarSubjects
+                    }
+                    WITH similarSubjects
+                    OPTIONAL MATCH (n:Entity {name: toLower($subject)})
+                    WITH similarSubjects + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allSubjects
+                    UNWIND allSubjects AS subject
+                    RETURN collect(subject) AS similarSubjects
+                """, params)[0]["similarSubjects"]
 
-                similarPredicates_query = """
-                CALL {
-                    CALL db.index.vector.queryNodes('vector_index_entity', 10, $predicate_emb)
-                    YIELD node AS vectorNode, score AS vectorScore
-                    WITH vectorNode, vectorScore
-                    WHERE vectorScore >= 0.96
-                    RETURN collect(vectorNode) AS similarPredicates
-                }
-                WITH similarPredicates
-                OPTIONAL MATCH (n:Entity {name: toLower($predicate)})
-                WITH similarPredicates + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allPredicates
-                UNWIND allPredicates AS predicate
-                RETURN collect(predicate) AS similarPredicates
-                """
-                similarPredicates = self.neo4j.run_query(similarPredicates_query, params)[0]["similarPredicates"]
+                similarPredicates = self.neo4j.run_query("""
+                    CALL {
+                        CALL db.index.vector.queryNodes('vector_index_entity', 10, $predicate_emb)
+                        YIELD node AS vectorNode, score AS vectorScore
+                        WITH vectorNode, vectorScore
+                        WHERE vectorScore >= 0.96
+                        RETURN collect(vectorNode) AS similarPredicates
+                    }
+                    WITH similarPredicates
+                    OPTIONAL MATCH (n:Entity {name: toLower($predicate)})
+                    WITH similarPredicates + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allPredicates
+                    UNWIND allPredicates AS predicate
+                    RETURN collect(predicate) AS similarPredicates
+                """, params)[0]["similarPredicates"]
 
-                similarObjects_query = """
-                CALL {
-                    CALL db.index.vector.queryNodes('vector_index_entity', 10, $object_emb)
-                    YIELD node AS vectorNode, score AS vectorScore
-                    WITH vectorNode, vectorScore
-                    WHERE vectorScore >= 0.96
-                    RETURN collect(vectorNode) AS similarObjects
-                }
-                WITH similarObjects
-                OPTIONAL MATCH (n:Entity {name: toLower($object)})
-                WITH similarObjects + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allObjects
-                UNWIND allObjects AS object
-                RETURN collect(object) AS similarObjects
-                """
-                similarObjects = self.neo4j.run_query(similarObjects_query, params)[0]["similarObjects"]
+                similarObjects = self.neo4j.run_query("""
+                    CALL {
+                        CALL db.index.vector.queryNodes('vector_index_entity', 10, $object_emb)
+                        YIELD node AS vectorNode, score AS vectorScore
+                        WITH vectorNode, vectorScore
+                        WHERE vectorScore >= 0.96
+                        RETURN collect(vectorNode) AS similarObjects
+                    }
+                    WITH similarObjects
+                    OPTIONAL MATCH (n:Entity {name: toLower($object)})
+                    WITH similarObjects + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allObjects
+                    UNWIND allObjects AS object
+                    RETURN collect(object) AS similarObjects
+                """, params)[0]["similarObjects"]
 
             except Exception as e:
                 logger.error(f"[Erreur] Recherche vectorielle échouée : {str(e)}")
                 logger.warning("[Neo4j] Vector search désactivée – fallback en exact match")
                 self.supports_vector = False
 
-        # Exact match fallback
         if not self.supports_vector:
             logger.info("[Neo4j] Fallback exact match")
 
-            exact_subject_query = """
-            OPTIONAL MATCH (n:Entity {name: toLower($subject)})
-            RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarSubjects
-            """
-            similarSubjects = self.neo4j.run_query(exact_subject_query, params)[0]["similarSubjects"]
+            similarSubjects = self.neo4j.run_query("""
+                OPTIONAL MATCH (n:Entity {name: toLower($subject)})
+                RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarSubjects
+            """, params)[0]["similarSubjects"]
 
-            exact_predicate_query = """
-            OPTIONAL MATCH (n:Entity {name: toLower($predicate)})
-            RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarPredicates
-            """
-            similarPredicates = self.neo4j.run_query(exact_predicate_query, params)[0]["similarPredicates"]
+            similarPredicates = self.neo4j.run_query("""
+                OPTIONAL MATCH (n:Entity {name: toLower($predicate)})
+                RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarPredicates
+            """, params)[0]["similarPredicates"]
 
-            exact_object_query = """
-            OPTIONAL MATCH (n:Entity {name: toLower($object)})
-            RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarObjects
-            """
-            similarObjects = self.neo4j.run_query(exact_object_query, params)[0]["similarObjects"]
+            similarObjects = self.neo4j.run_query("""
+                OPTIONAL MATCH (n:Entity {name: toLower($object)})
+                RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarObjects
+            """, params)[0]["similarObjects"]
 
         logger.info(f"[Neo4j] Similar nodes - Subjects: {len(similarSubjects)}, Predicates: {len(similarPredicates)}, Objects: {len(similarObjects)}")
 
-        # Création du triplet de base
+        # Création de base
         create_query = f"""
         MERGE (subjectNode:Entity {{name: toLower($subject)}})
         ON CREATE SET subjectNode.embeddings = $subject_emb, subjectNode.triplet_part = 'subject'
@@ -345,6 +338,10 @@ class TripletExtractor:
         ON CREATE SET r.label = 'triplet', r.embeddings = $predicate_emb
         ON MATCH SET r.label = 'triplet'
 
+        MERGE (chunk:Chunk {{id: $chunk_id}})
+        MERGE (chunk)-[:MENTIONS]->(subjectNode)
+        MERGE (chunk)-[:MENTIONS]->(objectNode)
+
         RETURN subjectNode.name AS subject, "{relation_label}" AS predicate, objectNode.name AS object
         """
         try:
@@ -353,7 +350,7 @@ class TripletExtractor:
         except Exception as e:
             logger.error(f"[Erreur] MERGE échoué pour {triplet} : {e}")
 
-        # Si des similar nodes sont trouvés, créer aussi les relations correspondantes
+        # Similar node match
         if similarSubjects and similarPredicates and similarObjects:
             query = f"""
             UNWIND $similarSubjects AS subject
@@ -373,6 +370,10 @@ class TripletExtractor:
             ON CREATE SET r.label = 'triplet', r.embeddings = $predicate_emb
             ON MATCH SET r.label = 'triplet'
 
+            MERGE (chunk:Chunk {{id: $chunk_id}})
+            MERGE (chunk)-[:MENTIONS]->(subjectNode)
+            MERGE (chunk)-[:MENTIONS]->(objectNode)
+
             RETURN subjectName AS subject, "{relation_label}" AS predicate, objectName AS object
             """
             final_params = {
@@ -382,6 +383,7 @@ class TripletExtractor:
                 "subject_emb": subject_emb.tolist(),
                 "predicate_emb": predicate_emb.tolist(),
                 "object_emb": object_emb.tolist(),
+                "chunk_id": chunk_id,
             }
             try:
                 results = self.neo4j.run_query(query, final_params)
@@ -393,6 +395,7 @@ class TripletExtractor:
 
         logger.info(f"[Triplet] Processed triplet: {triplet}")
         return results
+
 
 
     def process_chunk(
@@ -415,7 +418,7 @@ class TripletExtractor:
             triplets = self.extract_triplets(sent)
             all_triplets.extend(triplets)
             for triplet in triplets:
-                self.process_triplet(triplet)
+                self.process_triplet(triplet, chunk_id)
 
         logger.info(
             f"Extracted and processed {len(all_triplets)} triplets from chunk {chunk_id}"
