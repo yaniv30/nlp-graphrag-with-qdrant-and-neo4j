@@ -1,34 +1,68 @@
-import re
-import nltk
+# triplets_llama_index.py
+
+from typing import List, Tuple, Dict
 import os
-from typing import List, Tuple, Dict, Any
+import nltk
+from llama_index.llms.azure_openai import AzureOpenAI
+from llama_index.core.schema import Document
+from llama_index.core.node_parser import SimpleNodeParser
+from llama_index.core import SimpleDirectoryReader
+from llama_index.core.indices.property_graph import SchemaLLMPathExtractor, SimpleLLMPathExtractor
+from typing import Literal
+import nest_asyncio
+import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import unicodedata
+import re
+from collections import defaultdict
+import datetime
 from dotenv import load_dotenv
+nest_asyncio.apply()
+from llama_index.core.schema import TextNode
 from graphrag.connectors.neo4j_connection import get_connection
 from graphrag.utils.common import embed_text
 from graphrag.utils.logger import logger
-import torch
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load environment variables
 load_dotenv()
 
-try:
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-except ImportError:
-    AutoTokenizer = None
-    AutoModelForSeq2SeqLM = None
+api_key=os.getenv("API_KEY")
+api_version=os.getenv("API_VERSION")
+azure_endpoint=os.getenv("AZURE_ENDPOINT")
+engine=os.getenv("ENGINE")
+model=os.getenv("MODEL")
 
-# No need to download NLTK resources here as it's handled in __init__.py
+llm = AzureOpenAI(
+    model=model,
+    api_key=api_key,
+    api_base=azure_endpoint,
+    api_version=api_version,
+    engine=engine,
+)
 
-# Default model for triplet extraction from environment variables
-DEFAULT_TRIPLET_MODEL = os.getenv("TRIPLET_MODEL", "bew/t5_sentence_to_triplet_xl")
+# Entities/Relations
+entities = ["ENTREPRISE", "PERSONNE", "CONTRAT", "BENEFICIAIRE", "PROMETTANT", "DATE", "LOCATION"]
+relations = ["WORKS_AT", "PART_OF", "ACCORDED", "IS_CALLED", "CREATED_ON", "SIGNED", "SIGNED_ON", "SIGNED_AT"]
+validation_schema = [
+    ["PERSONNE", "WORKS_AT", "ENTREPRISE"],
+    ["PROMETTANT", "IS_CALLED", "ENTREPRISE"],
+    ["BENEFICIAIRE", "IS_CALLED", "ENTREPRISE"],
+    ["PERSONNE", "SIGNED", "CONTRAT"],
+    ["CONTRAT", "SIGNED_ON", "DATE"],
+    ["CONTRAT", "SIGNED_AT", "LOCATION"],
+    ["ENTREPRISE", "CREATED_ON", "DATE"],
+]
 
+kg_extractor = SchemaLLMPathExtractor(
+    llm=llm,
+    possible_entities=entities,
+    possible_relations=relations,
+    kg_validation_schema=validation_schema,
+    strict=False,
+)
 
 class TripletExtractor:
-    """Extract subject-relation-object triplets from text and map them into a Neo4j knowledge graph."""
-
-    def __init__(self, neo4j_conn=None, model_name=None):
+    def __init__(self, neo4j_conn=None):
         """
         Initialize the triplet extractor.
 
@@ -36,107 +70,12 @@ class TripletExtractor:
             neo4j_conn: A Neo4j connection instance.
             model_name: Hugging Face model name for triplet extraction.
         """
-        # Use environment variable if not provided
-        model_name = model_name or DEFAULT_TRIPLET_MODEL
-
-        if AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
-            raise ImportError(
-                "Transformers library is required for triplet extraction. "
-                "Install with 'pip install transformers'"
-            )
-
-        # Check for PEFT
-        try:
-            from peft import PeftModel
-
-            peft_available = True
-        except ImportError:
-            peft_available = False
-            logger.warning(
-                "PEFT library not available. If using adapter models, install with 'pip install peft'"
-            )
 
         self.neo4j = neo4j_conn or get_connection()
 
-        # Check if Neo4j supports vector search
-        try:
-            version_info = self.neo4j.run_query(
-                "CALL dbms.components() YIELD name, versions, edition RETURN name, versions, edition"
-            )
-            neo4j_version = None
-            neo4j_edition = None
-
-            for item in version_info:
-                if item.get("name") == "Neo4j Kernel":
-                    neo4j_version = item.get("versions", [""])[0]
-                    neo4j_edition = item.get("edition", "")
-
-            logger.info(
-                f"Detected Neo4j version {neo4j_version}, edition {neo4j_edition}"
-            )
-
-            # Vector indexes require Neo4j 5.11+ Enterprise Edition
-            self.supports_vector = False
-            if neo4j_edition == "enterprise" and neo4j_version:
-                major, minor = map(int, neo4j_version.split(".")[:2])
-                if major > 5 or (major == 5 and minor >= 11):
-                    self.supports_vector = True
-
-            if not self.supports_vector:
-                logger.warning(
-                    "Vector search not supported in this Neo4j version/edition. Will use text-based fallback."
-                )
-        except Exception as e:
-            logger.warning(
-                f"Could not determine Neo4j version/vector support: {str(e)}"
-            )
-            self.supports_vector = False
-
-        # Load the tokenizer and model with robust error handling
-        logger.info(f"Loading triplet extraction model: {model_name}")
-        try:
-            # Special handling for the PEFT adapter model
-            if model_name == "bew/t5_sentence_to_triplet_xl":
-                base_model_name = "google/flan-t5-xl"
-                logger.info(
-                    f"Using base model {base_model_name} for PEFT adapter {model_name}"
-                )
-
-                # Load the tokenizer from the base model
-                self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-
-                # Load the base model first
-                logger.info(f"Loading base model {base_model_name}")
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(base_model_name).to(device)
-
-                # If PEFT is available, load the adapter on top of the base model
-                if peft_available:
-                    from peft import PeftModel, PeftConfig
-
-                    logger.info(f"Loading PEFT adapter {model_name}")
-
-                    try:
-                        # Try loading the PEFT adapter
-                        self.model = PeftModel.from_pretrained(self.model, model_name).to(device)
-                        logger.info("PEFT adapter loaded successfully")
-                    except Exception as e:
-                        logger.error(f"Error loading PEFT adapter: {str(e)}")
-                        logger.warning("Continuing with base model only")
-                else:
-                    logger.warning("PEFT library not available. Using base model only.")
-            else:
-                # Standard model loading for non-adapter models
-                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
-
-            logger.info("Triplet extraction model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load model {model_name}: {str(e)}")
-            raise
-
-    def extract_triplets(self, sentence: str) -> List[Tuple[str, str, str]]:
+    def extract_triplets(self, chunk_text: str) -> List[Tuple[str, str, str]]:
         """
-        Extract triplets from a sentence using the T5 model.
+        Extract triplets from a sentence using the llama-index SchemaLLMPathExtractor model.
 
         Args:
             sentence: Input sentence.
@@ -144,94 +83,25 @@ class TripletExtractor:
         Returns:
             List of (subject, relation, object) triplets.
         """
-        try:
-            # Encode input sentence and generate model output
-            inputs = self.tokenizer(sentence, return_tensors="pt").to(device)
-            outputs = self.model.generate(**inputs, max_length=64)
-            # Do not skip special tokens so markers are preserved if present
-            triplet_text = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
-            logger.debug(f"Raw triplet model output: {triplet_text}")
+        node = TextNode(text=chunk_text)
+        res = kg_extractor([node])
+        results = []
 
-            triplets = []
-            # If expected markers exist, use the original logic.
-            if "<triplet>" in triplet_text:
-                for segment in triplet_text.split("<triplet>"):
-                    if segment.strip():
-                        triple_content = (
-                            segment.split("</triplet>")[0]
-                            if "</triplet>" in segment
-                            else segment
-                        )
-                        triple_content = triple_content.replace("<pad>", "")
-                        if (
-                            "<relation>" in triple_content
-                            and "<object>" in triple_content
-                        ):
-                            subj = triple_content.split("<relation>")[0].strip()
-                            rel = (
-                                triple_content.split("<relation>")[1]
-                                .split("<object>")[0]
-                                .strip()
-                            )
-                            obj = triple_content.split("<object>")[1].strip()
-                            if subj and rel and obj:
-                                triplets.append((subj, rel, obj))
-            else:
-                # Heuristic: Remove <pad> and </s>, then split on two or more spaces.
-                cleaned_text = (
-                    triplet_text.replace("<pad>", "").replace("</s>", "").strip()
-                )
-                parts = re.split(r"\s{2,}", cleaned_text)
-                if len(parts) == 3:
-                    subj, rel, obj = (
-                        parts[0].strip(),
-                        parts[1].strip(),
-                        parts[2].strip(),
-                    )
-                    triplets.append((subj, rel, obj))
-                else:
-                    logger.warning(
-                        f"Unexpected triplet format for sentence: '{sentence}'. Model output: '{triplet_text}'"
-                    )
+        for i in range(len(res)):
+            triplets = res[i].metadata['relations']
+            for triplet in triplets:
+                results.append((triplet.source_id, triplet.label, triplet.target_id))
+        return results
 
-            if not triplets:
-                logger.warning(
-                    f"No triplets extracted for sentence: '{sentence}'. Model output: '{triplet_text}'"
-                )
-            else:
-                logger.debug(f"Extracted triplets: {triplets}")
-            return triplets
-
-        except Exception as e:
-            logger.error(f"Error extracting triplets from sentence: {str(e)}")
-            logger.error(f"Sentence: {sentence[:100]}...")
-            return []
-
-    def sanitize_relation(self, rel: str) -> str:
-        """
-        Sanitize the relation string to be a valid Neo4j relationship type.
-
-        Args:
-            rel: Relation string.
-
-        Returns:
-            Sanitized relation string.
-        """
-        rel_clean = re.sub(r"[^0-9a-zA-Z_ ]", "", rel)
-        return rel_clean.replace(" ", "_").upper()
-
-    def process_triplet(self, triplet: Tuple[str, str, str], chunk_id: str) -> Any:
+    def process_triplet(self, triplet: Tuple[str, str, str], chunk_id: str):
         """
         Process a single triplet: compute embeddings, search for similar nodes via vector queries,
         and merge the triplet into the Neo4j graph, linking subject/object to their source chunk.
         """
         subject, predicate, object_ = triplet
         logger.info(f"[Triplet] Reçu : {triplet}")
-
-        # Nettoyage du label de relation
         relation_label = predicate.strip().upper().replace(" ", "_").replace("-", "_")
 
-        # Embeddings
         subject_emb = embed_text(subject)
         predicate_emb = embed_text(predicate)
         object_emb = embed_text(object_)
@@ -246,85 +116,6 @@ class TripletExtractor:
             "chunk_id": chunk_id,
         }
 
-        similarSubjects = []
-        similarPredicates = []
-        similarObjects = []
-
-        if self.supports_vector:
-            try:
-                logger.info("[Neo4j] Recherche vectorielle activée")
-
-                similarSubjects = self.neo4j.run_query("""
-                    CALL {
-                        CALL db.index.vector.queryNodes('vector_index_entity', 10, $subject_emb)
-                        YIELD node AS vectorNode, score AS vectorScore
-                        WITH vectorNode, vectorScore
-                        WHERE vectorScore >= 0.96
-                        RETURN collect(vectorNode) AS similarSubjects
-                    }
-                    WITH similarSubjects
-                    OPTIONAL MATCH (n:Entity {name: toLower($subject)})
-                    WITH similarSubjects + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allSubjects
-                    UNWIND allSubjects AS subject
-                    RETURN collect(subject) AS similarSubjects
-                """, params)[0]["similarSubjects"]
-
-                similarPredicates = self.neo4j.run_query("""
-                    CALL {
-                        CALL db.index.vector.queryNodes('vector_index_entity', 10, $predicate_emb)
-                        YIELD node AS vectorNode, score AS vectorScore
-                        WITH vectorNode, vectorScore
-                        WHERE vectorScore >= 0.96
-                        RETURN collect(vectorNode) AS similarPredicates
-                    }
-                    WITH similarPredicates
-                    OPTIONAL MATCH (n:Entity {name: toLower($predicate)})
-                    WITH similarPredicates + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allPredicates
-                    UNWIND allPredicates AS predicate
-                    RETURN collect(predicate) AS similarPredicates
-                """, params)[0]["similarPredicates"]
-
-                similarObjects = self.neo4j.run_query("""
-                    CALL {
-                        CALL db.index.vector.queryNodes('vector_index_entity', 10, $object_emb)
-                        YIELD node AS vectorNode, score AS vectorScore
-                        WITH vectorNode, vectorScore
-                        WHERE vectorScore >= 0.96
-                        RETURN collect(vectorNode) AS similarObjects
-                    }
-                    WITH similarObjects
-                    OPTIONAL MATCH (n:Entity {name: toLower($object)})
-                    WITH similarObjects + CASE WHEN n IS NULL THEN [] ELSE [n] END AS allObjects
-                    UNWIND allObjects AS object
-                    RETURN collect(object) AS similarObjects
-                """, params)[0]["similarObjects"]
-
-            except Exception as e:
-                logger.error(f"[Erreur] Recherche vectorielle échouée : {str(e)}")
-                logger.warning("[Neo4j] Vector search désactivée – fallback en exact match")
-                self.supports_vector = False
-
-        if not self.supports_vector:
-            logger.info("[Neo4j] Fallback exact match")
-
-            similarSubjects = self.neo4j.run_query("""
-                OPTIONAL MATCH (n:Entity {name: toLower($subject)})
-                RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarSubjects
-            """, params)[0]["similarSubjects"]
-
-            similarPredicates = self.neo4j.run_query("""
-                OPTIONAL MATCH (n:Entity {name: toLower($predicate)})
-                RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarPredicates
-            """, params)[0]["similarPredicates"]
-
-            similarObjects = self.neo4j.run_query("""
-                OPTIONAL MATCH (n:Entity {name: toLower($object)})
-                RETURN CASE WHEN n IS NULL THEN [] ELSE [n] END AS similarObjects
-            """, params)[0]["similarObjects"]
-
-        logger.info(f"[Neo4j] Similar nodes - Subjects: {len(similarSubjects)}, Predicates: {len(similarPredicates)}, Objects: {len(similarObjects)}")
-
-        # Création de base
         create_query = f"""
         MERGE (subjectNode:Entity {{name: toLower($subject)}})
         ON CREATE SET subjectNode.embeddings = $subject_emb, subjectNode.triplet_part = 'subject'
@@ -341,7 +132,6 @@ class TripletExtractor:
         MERGE (chunk:Chunk {{id: $chunk_id}})
         MERGE (chunk)-[:MENTIONS]->(subjectNode)
         MERGE (chunk)-[:MENTIONS]->(objectNode)
-
         RETURN subjectNode.name AS subject, "{relation_label}" AS predicate, objectNode.name AS object
         """
         try:
@@ -350,57 +140,27 @@ class TripletExtractor:
         except Exception as e:
             logger.error(f"[Erreur] MERGE échoué pour {triplet} : {e}")
 
-        # Similar node match
-        if similarSubjects and similarPredicates and similarObjects:
-            query = f"""
-            UNWIND $similarSubjects AS subject
-            UNWIND $similarPredicates AS predicate
-            UNWIND $similarObjects AS object
-            WITH subject.name AS subjectName, predicate.name AS predicateName, object.name AS objectName, subject, predicate, object
+    def sanitize_relation(self, rel: str) -> str:
+        """
+        Sanitize the relation string to be a valid Neo4j relationship type.
 
-            MERGE (subjectNode:Entity {{name: toLower(subjectName)}})
-            ON CREATE SET subjectNode.embeddings = $subject_emb, subjectNode.triplet_part = 'subject'
-            ON MATCH SET subjectNode.triplet_part = 'subject'
+        Args:
+            rel: Relation string.
 
-            MERGE (objectNode:Entity {{name: toLower(objectName)}})
-            ON CREATE SET objectNode.embeddings = $object_emb, objectNode.triplet_part = 'object'
-            ON MATCH SET objectNode.triplet_part = 'object'
+        Returns:
+            Sanitized relation string.
+        """
+        rel_clean = re.sub(r"[^0-9a-zA-Z_ ]", "", rel)
+        return rel_clean.replace(" ", "_").upper()
+    
+    def process_chunk(self, chunk_id: str, chunk_text: str) -> List[Tuple[str, str, str]]:
+        logger.info(f"Processing chunk {chunk_id} for triplet extraction")
+        triplets = self.extract_triplets(chunk_text)
+        for triplet in triplets:
+            self.process_triplet(triplet, chunk_id)
+        return triplets
 
-            MERGE (subjectNode)-[r:{relation_label}]->(objectNode)
-            ON CREATE SET r.label = 'triplet', r.embeddings = $predicate_emb
-            ON MATCH SET r.label = 'triplet'
-
-            MERGE (chunk:Chunk {{id: $chunk_id}})
-            MERGE (chunk)-[:MENTIONS]->(subjectNode)
-            MERGE (chunk)-[:MENTIONS]->(objectNode)
-
-            RETURN subjectName AS subject, "{relation_label}" AS predicate, objectName AS object
-            """
-            final_params = {
-                "similarSubjects": similarSubjects,
-                "similarPredicates": similarPredicates,
-                "similarObjects": similarObjects,
-                "subject_emb": subject_emb.tolist(),
-                "predicate_emb": predicate_emb.tolist(),
-                "object_emb": object_emb.tolist(),
-                "chunk_id": chunk_id,
-            }
-            try:
-                results = self.neo4j.run_query(query, final_params)
-                logger.info(f"[Neo4j] UNWIND effectué pour {triplet}")
-            except Exception as e:
-                logger.error(f"[Erreur] UNWIND échoué pour {triplet} : {e}")
-        else:
-            results = [{"subject": subject, "predicate": predicate, "object": object_}]
-
-        logger.info(f"[Triplet] Processed triplet: {triplet}")
-        return results
-
-
-
-    def process_chunk(
-        self, chunk_id: str, chunk_text: str
-    ) -> List[Tuple[str, str, str]]:
+    def process_chunks(self, chunks: List[Tuple[str, str]]) -> Dict[str, List[Tuple[str, str, str]]]:
         """
         Process a text chunk: split into sentences, extract triplets from each, and map each triplet into the graph.
 
@@ -410,32 +170,6 @@ class TripletExtractor:
 
         Returns:
             List of extracted triplets.
-        """
-        logger.info(f"Processing chunk {chunk_id} for triplet extraction")
-        sentences = nltk.sent_tokenize(chunk_text)
-        all_triplets = []
-        for sent in sentences:
-            triplets = self.extract_triplets(sent)
-            all_triplets.extend(triplets)
-            for triplet in triplets:
-                self.process_triplet(triplet, chunk_id)
-
-        logger.info(
-            f"Extracted and processed {len(all_triplets)} triplets from chunk {chunk_id}"
-        )
-        return all_triplets
-
-    def process_chunks(
-        self, chunks: List[Tuple[str, str]]
-    ) -> Dict[str, List[Tuple[str, str, str]]]:
-        """
-        Process multiple text chunks.
-
-        Args:
-            chunks: List of tuples (chunk_id, chunk_text).
-
-        Returns:
-            Dictionary mapping each chunk_id to its list of triplets.
         """
         results = {}
         for chunk_id, chunk_text in chunks:
